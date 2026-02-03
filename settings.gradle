@@ -94,6 +94,10 @@ if (settings.hasProperty('skipCodegen') && skipCodegen.toBoolean()) {
     project(':grpc-compiler').projectDir = "$rootDir/compiler" as File
 }
 
+if (!settings.hasProperty('skipAndroid')) {
+    ext.skipAndroid = true
+}
+
 if (settings.hasProperty('skipAndroid') && skipAndroid.toBoolean()) {
     println '  * Skipping the build of Android projects because skipAndroid=true'
 } else {
