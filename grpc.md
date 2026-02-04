@@ -5,17 +5,29 @@
 ```mermaid
 sequenceDiagram
   autonumber
-  participant AppC as Client App<br>职责: 业务发起调用
-  participant Stub as Client Stub<br>职责: 生成/发起 RPC 调用
-  participant Call as ClientCall<br>职责: 管理单次 RPC 状态
-  participant WQ as WriteQueue<br>职责: 写命令队列/切到 EventLoop
-  participant NHC as Netty Client Handler<br>职责: 客户端帧编解码/事件分发
-  participant NChC as Netty Client Channel<br>职责: 客户端 HTTP/2 读写通道
+  box "客户端应用线程/回调线程（CallOptions.executor）"
+    participant AppC as Client App<br>职责: 业务发起调用
+    participant Stub as Client Stub<br>职责: 生成/发起 RPC 调用
+    participant Call as ClientCall<br>职责: 管理单次 RPC 状态
+  end
+  box "客户端传输线程（Netty EventLoop）"
+    participant WQ as WriteQueue<br>职责: 写命令队列/切到 EventLoop
+    participant NHC as Netty Client Handler<br>职责: 客户端帧编解码/事件分发
+    participant NChC as Netty Client Channel<br>职责: 客户端 HTTP/2 读写通道
+  end
   participant Net as Network/TCP<br>职责: 传输链路
-  participant NChS as Netty Server Channel<br>职责: 服务端 HTTP/2 读写通道
-  participant NHS as Netty Server Handler<br>职责: 服务端帧编解码/事件分发
-  participant SCall as ServerCall<br>职责: 服务端调用状态
-  participant Svc as Service Impl<br>职责: 业务实现
+  box "服务端传输线程（Netty EventLoop）"
+    participant NChS as Netty Server Channel<br>职责: 服务端 HTTP/2 读写通道
+    participant NHS as Netty Server Handler<br>职责: 服务端帧编解码/事件分发
+  end
+  box "服务端应用线程/回调线程（ServerBuilder.executor）"
+    participant SCall as ServerCall<br>职责: 服务端调用状态
+    participant Svc as Service Impl<br>职责: 业务实现
+  end
+
+  Note over WQ,NHC: WriteQueue.enqueue 可由任意线程调用<br>/write/flush 在 EventLoop 执行
+  Note over AppC,Call: ClientCall.Listener 回调<br>/通过 callExecutor 执行（默认共享线程池/可 direct）
+  Note over SCall,Svc: ServerCall.Listener 回调<br>/通过 server executor 执行（默认共享线程池）
 
   Note over AppC,Svc: 一元（Unary）
   AppC->>Stub: unaryCall(req) - 触发一元调用
@@ -49,8 +61,8 @@ sequenceDiagram
   NChS-->>Net: TCP send DATA
   Net-->>NChC: TCP recv DATA
   NChC-->>NHC: channelRead - 客户端入站事件
-  NHC-->>Call: onMessage(resp) - 客户端收到响应
-  NHC-->>Call: onClose(status, trailers) - 结束调用
+  NHC-->>Call: onMessage(resp) - callExecutor 回调
+  NHC-->>Call: onClose(status, trailers) - callExecutor 回调
 
   Note over AppC,Svc: 服务端流式（Server Streaming）
   AppC->>Stub: serverStreamingCall(req) - 触发服务端流式
@@ -85,9 +97,9 @@ sequenceDiagram
     NChS-->>Net: TCP send DATA
     Net-->>NChC: TCP recv DATA
     NChC-->>NHC: channelRead - 客户端入站事件
-    NHC-->>Call: onMessage(resp) - 客户端收到响应
+    NHC-->>Call: onMessage(resp) - callExecutor 回调
   end
-  NHC-->>Call: onClose(status, trailers) - 结束调用
+  NHC-->>Call: onClose(status, trailers) - callExecutor 回调
 
   Note over AppC,Svc: 客户端流式（Client Streaming）
   AppC->>Stub: clientStreamingCall() - 触发客户端流式
@@ -123,8 +135,8 @@ sequenceDiagram
   NChS-->>Net: TCP send DATA
   Net-->>NChC: TCP recv DATA
   NChC-->>NHC: channelRead - 客户端入站事件
-  NHC-->>Call: onMessage(resp) - 客户端收到响应
-  NHC-->>Call: onClose(status, trailers) - 结束调用
+  NHC-->>Call: onMessage(resp) - callExecutor 回调
+  NHC-->>Call: onClose(status, trailers) - callExecutor 回调
 
   Note over AppC,Svc: 双向流式（Bidi Streaming）
   AppC->>Stub: bidiStreamingCall() - 触发双向流式
@@ -163,10 +175,10 @@ sequenceDiagram
       NChS-->>Net: TCP send DATA
       Net-->>NChC: TCP recv DATA
       NChC-->>NHC: channelRead - 客户端入站事件
-      NHC-->>Call: onMessage(resp) - 客户端收到响应
+      NHC-->>Call: onMessage(resp) - callExecutor 回调
     end
   end
-  NHC-->>Call: onClose(status, trailers) - 结束调用
+  NHC-->>Call: onClose(status, trailers) - callExecutor 回调
 ```
 
 ## 2) 关键类关系图（Mermaid DSL，含职责与 API 作用）
@@ -174,120 +186,169 @@ sequenceDiagram
 ```mermaid
 classDiagram
   class ManagedChannelBuilder {
-    <<职责: 创建通道配置>>
-    +forAddress(host, port) 构建目标地址
-    +usePlaintext() 关闭 TLS
-    +build() 创建通道
+    <<职责: 通道配置/构建>>
+    +forAddress(host, port)
+    +executor(Executor)
+    +build() ManagedChannel
+  }
+  class NettyChannelBuilder {
+    <<职责: Netty 客户端通道配置>>
+    +forAddress(host, port)
+    +eventLoopGroup(EventLoopGroup)
+    +channelType(Class)
+  }
+  ManagedChannelBuilder <|-- NettyChannelBuilder
+
+  class Channel {
+    <<职责: 客户端通道接口>>
+    +newCall(MethodDescriptor, CallOptions)
   }
   class ManagedChannel {
-    <<职责: 客户端通道>>
-    +newCall(MethodDescriptor, CallOptions) 创建 ClientCall
-    +shutdown() 关闭通道
+    <<职责: 客户端通道生命周期>>
+    +shutdown()
+    +awaitTermination(timeout, unit)
   }
+  Channel <|-- ManagedChannel
+
   class AbstractStub~T~ {
-    <<职责: 生成具体 Stub>>
-    +withDeadlineAfter() 设置超时
-    +build(Channel, CallOptions) 构建新 Stub
+    <<职责: 生成 Stub 并发起调用>>
+    +build(Channel, CallOptions)
+    +withDeadlineAfter(...)
   }
+  AbstractStub~T~ --> Channel
+  AbstractStub~T~ --> CallOptions
+  AbstractStub~T~ --> MethodDescriptor~Req,Resp~
+
   class ClientCall~Req,Resp~ {
     <<职责: 单次 RPC 生命周期>>
-    +start(Listener, Metadata) 注册回调并开始
-    +request(int) 拉取响应
-    +sendMessage(Req) 发送请求
-    +halfClose() 发送完成
-    +cancel(String, Throwable) 取消调用
+    +start(Listener, Metadata)
+    +request(int)
+    +sendMessage(Req)
+    +halfClose()
+    +cancel(String, Throwable)
   }
   class ClientCall_Listener~Resp~ {
-    <<职责: 客户端回调>>
-    +onMessage(Resp) 接收响应
-    +onReady() 可继续发送
-    +onClose(Status, Metadata) 完成/失败
+    <<职责: ClientCall.Listener 回调>>
+    +onHeaders(Metadata)
+    +onMessage(Resp)
+    +onClose(Status, Metadata)
+    +onReady()
+  }
+  ClientCall~Req,Resp~ --> ClientCall_Listener~Resp~ : callbacks
+
+  class ClientCalls {
+    <<职责: Stub ↔ ClientCall 适配>>
+    +blockingUnaryCall(...)
+    +asyncUnaryCall(...)
+    +futureUnaryCall(...)
+  }
+  ClientCalls --> ClientCall~Req,Resp~
+  ClientCalls --> StreamObserver~T~ : adapts
+
+  class StreamObserver~T~ {
+    <<职责: 应用层流回调>>
+    +onNext(T)
+    +onError(Throwable)
+    +onCompleted()
   }
   class MethodDescriptor~Req,Resp~ {
     <<职责: 方法元数据>>
   }
   class CallOptions {
-    <<职责: 调用配置>>
-  }
-  class ClientCalls {
-    <<职责: Stub 到 ClientCall 适配>>
-  }
-  class StreamObserver~T~ {
-    <<职责: 业务层流回调>>
-    +onNext(T) 推送消息
-    +onError(Throwable) 错误通知
-    +onCompleted() 完成通知
+    <<职责: 调用配置/Executor>>
+    +withDeadlineAfter(...)
+    +withExecutor(Executor)
   }
 
   class ServerBuilder {
-    <<职责: 创建服务端>>
-    +forPort(int) 设置端口
-    +addService(BindableService) 注册服务
-    +build() 构建实例
-    +start() 启动服务
+    <<职责: 服务端构建/配置>>
+    +forPort(int)
+    +executor(Executor)
+    +addService(BindableService)
+    +build() Server
   }
+  class NettyServerBuilder {
+    <<职责: Netty 服务端配置>>
+    +forPort(int)
+    +bossEventLoopGroup(EventLoopGroup)
+    +workerEventLoopGroup(EventLoopGroup)
+    +channelType(Class)
+  }
+  ServerBuilder <|-- NettyServerBuilder
+
   class Server {
     <<职责: 服务端生命周期>>
-    +start() 启动
-    +shutdown() 关闭
+    +start()
+    +shutdown()
+    +awaitTermination(...)
   }
+  ServerBuilder --> Server : builds
+
   class BindableService {
-    <<职责: 暴露服务定义>>
-    +bindService() 生成 ServiceDefinition
+    <<职责: 绑定服务定义>>
+    +bindService() ServerServiceDefinition
   }
   class ServerServiceDefinition {
     <<职责: 方法到处理器映射>>
   }
+  BindableService --> ServerServiceDefinition : bindService()
+
   class ServerCall~Req,Resp~ {
     <<职责: 服务端单次调用>>
-    +sendHeaders(Metadata) 发送响应头
-    +sendMessage(Resp) 发送响应
-    +request(int) 拉取请求
-    +close(Status, Metadata) 结束调用
+    +sendHeaders(Metadata)
+    +sendMessage(Resp)
+    +request(int)
+    +close(Status, Metadata)
   }
   class ServerCall_Listener~Req~ {
-    <<职责: 服务端回调>>
-    +onMessage(Req) 接收请求
-    +onHalfClose() 客户端发完
-    +onCancel() 被取消
-    +onComplete() 正常结束
-    +onReady() 可继续发送
+    <<职责: ServerCall.Listener 回调>>
+    +onMessage(Req)
+    +onHalfClose()
+    +onCancel()
+    +onComplete()
+    +onReady()
   }
-  class ServerCalls {
-    <<职责: Service 到 ServerCall 适配>>
-  }
-
-  class NettyClientChannel {
-    <<职责: 客户端 HTTP/2 通道>>
-  }
-  class NettyClientHandler {
-    <<职责: 客户端入站处理>>
-  }
-  class NettyServerChannel {
-    <<职责: 服务端 HTTP/2 通道>>
-  }
-  class NettyServerHandler {
-    <<职责: 服务端入站处理>>
-  }
-
-  ManagedChannelBuilder --> ManagedChannel : builds
-  ManagedChannel --> ClientCall~Req,Resp~ : newCall()
-  AbstractStub~T~ --> ManagedChannel : uses
-  AbstractStub~T~ --> MethodDescriptor~Req,Resp~ : uses
-  AbstractStub~T~ --> CallOptions : uses
-  ClientCalls --> ClientCall~Req,Resp~ : creates
-  ClientCall~Req,Resp~ --> ClientCall_Listener~Resp~ : callbacks
-  ClientCalls --> StreamObserver~T~ : adapts
-
-  ServerBuilder --> Server : builds
-  BindableService --> ServerServiceDefinition : bindService()
-  ServerBuilder --> ServerServiceDefinition : addService
-  ServerCalls --> ServerCall~Req,Resp~ : uses
   ServerCall~Req,Resp~ --> ServerCall_Listener~Req~ : callbacks
+
+  class ServerCalls {
+    <<职责: Service ↔ ServerCall 适配>>
+    +asyncUnaryCall(...)
+    +asyncServerStreamingCall(...)
+  }
+  ServerCalls --> ServerCall~Req,Resp~
   ServerCalls --> StreamObserver~T~ : adapts
 
-  ClientCall~Req,Resp~ --> NettyClientChannel : writes
-  NettyClientChannel --> NettyClientHandler : inbound
-  NettyServerHandler --> ServerCall~Req,Resp~ : dispatch
-  NettyServerChannel --> NettyServerHandler : inbound
+  class NettyClientTransport {
+    <<职责: 客户端传输/创建 Stream>>
+    +start()
+    +newStream()
+  }
+  class NettyClientHandler {
+    <<职责: 客户端 HTTP/2 帧处理>>
+  }
+  class NettyClientStream {
+    <<职责: 客户端 Stream（写入/入站回调）>>
+  }
+  class NettyServerHandler {
+    <<职责: 服务端 HTTP/2 帧处理>>
+  }
+  class NettyServerStream {
+    <<职责: 服务端 Stream（写入/入站回调）>>
+  }
+  class WriteQueue {
+    <<职责: 写命令队列/切到 EventLoop>>
+    +enqueue(...)
+    +scheduleFlush()
+  }
+
+  NettyChannelBuilder --> NettyClientTransport : builds/uses
+  NettyClientTransport --> NettyClientHandler : owns
+  NettyClientTransport --> NettyClientStream : creates
+  NettyClientHandler --> WriteQueue : owns
+  NettyClientStream --> WriteQueue : enqueue
+
+  NettyServerBuilder --> NettyServerHandler : builds/uses
+  NettyServerHandler --> NettyServerStream : creates
+  NettyServerHandler --> WriteQueue : owns
+  NettyServerStream --> WriteQueue : enqueue
 ```
